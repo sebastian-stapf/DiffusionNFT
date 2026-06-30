@@ -1,7 +1,17 @@
-import imp
+import importlib.util
 import os
 
-base = imp.load_source("base", os.path.join(os.path.dirname(__file__), "base.py"))
+
+def _load_source(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load {name} config from {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+base = _load_source("base", os.path.join(os.path.dirname(__file__), "base.py"))
 
 
 def get_config(name):

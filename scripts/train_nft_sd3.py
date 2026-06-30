@@ -374,7 +374,22 @@ def main(_):
     if is_main_process(rank):
         log_dir = os.path.join(config.logdir, config.run_name)
         os.makedirs(log_dir, exist_ok=True)
-        wandb.init(project="flow-grpo", name=config.run_name, config=config.to_dict(), dir=log_dir)
+        wandb_kwargs = {
+            "project": os.environ.get("WANDB_PROJECT", "flow-grpo"),
+            "name": config.run_name,
+            "config": config.to_dict(),
+            "dir": log_dir,
+        }
+        wandb_entity = os.environ.get("WANDB_ENTITY")
+        wandb_group = os.environ.get("WANDB_RUN_GROUP")
+        wandb_job_type = os.environ.get("WANDB_JOB_TYPE")
+        if wandb_entity:
+            wandb_kwargs["entity"] = wandb_entity
+        if wandb_group:
+            wandb_kwargs["group"] = wandb_group
+        if wandb_job_type:
+            wandb_kwargs["job_type"] = wandb_job_type
+        wandb.init(**wandb_kwargs)
     logger.info(f"\n{config}")
 
     set_seed(config.seed, rank)  # Pass rank for different seeds per process
