@@ -887,12 +887,12 @@ def wandb_surrogate_images(
             record,
             prediction=row["prediction"],
             target=row["target"],
-            title=f"{prefix}: {row['method']} / {row['variant']}",
+            title=f"{prefix}: {row['split']} / {row['method']} / {row['variant']}",
         )
         image_path = output_dir / f"{prefix}_{index:03d}.jpg"
         image.save(image_path)
         caption = (
-            f"{row['method']} | {row['variant']} | {row['rubric']} | "
+            f"{row['split']} | {row['method']} | {row['variant']} | {row['rubric']} | "
             f"{str(row['prompt'])[:160]}"
         )
         images.append(wandb.Image(str(image_path), caption=caption))
@@ -1272,6 +1272,38 @@ def flatten_metrics(prefix: str, metrics: dict[str, float]) -> dict[str, float]:
     return {f"{prefix}/{key}": value for key, value in metrics.items()}
 
 
+def write_split_generated_images(
+    models: dict[str, TinyConditionedFlow],
+    records: Sequence[PromptRecord],
+    split_name: str,
+    output_root: Path,
+    device: torch.device,
+    limit_per_method: int = 4,
+) -> tuple[list[wandb.Image], Path, int]:
+    """Write generated train/val sample media from the tiny image-main substrate."""
+
+    rows: list[dict[str, Any]] = []
+    sampled_records = list(records[:limit_per_method])
+    for method, model in models.items():
+        variant = "correct" if method == "critique_full" else "default"
+        _, method_rows = evaluate_model(
+            model,
+            sampled_records,
+            method,
+            device,
+            variant=variant,
+        )
+        rows.extend(method_rows[:limit_per_method])
+    image_dir = output_root / f"{split_name}_generated_images"
+    images = wandb_surrogate_images(
+        rows,
+        output_dir=image_dir,
+        prefix=f"{split_name}_generated",
+        limit=len(rows),
+    )
+    return images, image_dir, len(images)
+
+
 def run_image_main(cfg: ImageMainConfig) -> dict[str, Any]:
     """Run the group-01 manifest, smoke, training, evaluation, and artifact path."""
 
@@ -1359,6 +1391,34 @@ def run_image_main(cfg: ImageMainConfig) -> dict[str, Any]:
         write_jsonl(
             cfg.log_path, {"event": "evaluation", "method": method, **method_metrics}
         )
+
+    for split_name, split_records in (
+        ("train", train_records),
+        ("val", manifests["val"]),
+    ):
+        split_images, split_image_dir, split_image_count = write_split_generated_images(
+            models,
+            split_records,
+            split_name,
+            eval_sample_dir,
+            device,
+        )
+        metrics[f"{split_name}_generated_image_dir"] = str(split_image_dir)
+        metrics[f"{split_name}_generated_image_count"] = split_image_count
+        write_jsonl(
+            cfg.log_path,
+            {
+                "event": "split_generated_images",
+                "split": split_name,
+                "path": str(split_image_dir),
+                "count": split_image_count,
+            },
+        )
+        if wandb_run is not None:
+            if split_name == "train":
+                wandb.log({"images": split_images, "train_images": split_images})
+            else:
+                wandb.log({"eval_images": split_images, "val_images": split_images})
 
     rollout_rows: list[dict[str, Any]] = []
     critique_rows: list[dict[str, Any]] = []
