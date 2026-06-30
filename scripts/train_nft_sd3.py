@@ -13,35 +13,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections import defaultdict
-import os
 import datetime
-from concurrent import futures
-import time
 import json
-from absl import app, flags
 import logging
-from diffusers import StableDiffusion3Pipeline
-import numpy as np
+import os
+import random
+import tempfile
+import time
+from collections import defaultdict
+from concurrent import futures
+from functools import partial
+from pathlib import Path
+
 import flow_grpo.rewards
-from flow_grpo.stat_tracking import PerPromptStatTracker
-from flow_grpo.diffusers_patch.pipeline_with_logprob import pipeline_with_logprob
-from flow_grpo.diffusers_patch.train_dreambooth_lora_sd3 import encode_prompt
+import numpy as np
 import torch
 import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data.distributed import DistributedSampler
-import wandb
-from functools import partial
 import tqdm
-import tempfile
-from PIL import Image
-from peft import LoraConfig, get_peft_model, PeftModel
-import random
-from torch.utils.data import Dataset, DataLoader, Sampler
+import wandb
+from absl import app, flags
+from diffusers import StableDiffusion3Pipeline
+from flow_grpo import critique_nft
+from flow_grpo.diffusers_patch.pipeline_with_logprob import pipeline_with_logprob
+from flow_grpo.diffusers_patch.train_dreambooth_lora_sd3 import encode_prompt
 from flow_grpo.ema import EMAModuleWrapper
+from flow_grpo.stat_tracking import PerPromptStatTracker
 from ml_collections import config_flags
-from torch.cuda.amp import GradScaler, autocast as torch_autocast
+from peft import LoraConfig, PeftModel, get_peft_model
+from PIL import Image
+from torch.cuda.amp import GradScaler
+from torch.cuda.amp import autocast as torch_autocast
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, Dataset, Sampler
+from torch.utils.data.distributed import DistributedSampler
 
 tqdm = partial(tqdm.tqdm, dynamic_ncols=True)
 
@@ -51,7 +55,9 @@ config_flags.DEFINE_config_file("config", "config/base.py", "Training configurat
 
 logger = logging.getLogger(__name__)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
 
 
 def setup_distributed(rank, lock_rank, world_size):
@@ -79,7 +85,7 @@ def set_seed(seed: int, rank: int = 0):
 class TextPromptDataset(Dataset):
     def __init__(self, dataset, split="train"):
         self.file_path = os.path.join(dataset, f"{split}.txt")
-        with open(self.file_path, "r") as f:
+        with open(self.file_path) as f:
             self.prompts = [line.strip() for line in f.readlines()]
 
     def __len__(self):
@@ -98,7 +104,7 @@ class TextPromptDataset(Dataset):
 class GenevalPromptDataset(Dataset):
     def __init__(self, dataset, split="train"):
         self.file_path = os.path.join(dataset, f"{split}_metadata.jsonl")
-        with open(self.file_path, "r", encoding="utf-8") as f:
+        with open(self.file_path, encoding="utf-8") as f:
             self.metadatas = [json.loads(line) for line in f]
             self.prompts = [item["prompt"] for item in self.metadatas]
 
@@ -160,7 +166,9 @@ def gather_tensor_to_all(tensor, world_size):
 
 def compute_text_embeddings(prompt, text_encoders, tokenizers, max_sequence_length, device):
     with torch.no_grad():
-        prompt_embeds, pooled_prompt_embeds = encode_prompt(text_encoders, tokenizers, prompt, max_sequence_length)
+        prompt_embeds, pooled_prompt_embeds = encode_prompt(
+            text_encoders, tokenizers, prompt, max_sequence_length
+        )
         prompt_embeds = prompt_embeds.to(device)
         pooled_prompt_embeds = pooled_prompt_embeds.to(device)
     return prompt_embeds, pooled_prompt_embeds
@@ -191,7 +199,9 @@ def return_decay(step, decay_type):
 
 def calculate_zero_std_ratio(prompts, gathered_rewards):
     prompt_array = np.array(prompts)
-    unique_prompts, inverse_indices, counts = np.unique(prompt_array, return_inverse=True, return_counts=True)
+    unique_prompts, inverse_indices, counts = np.unique(
+        prompt_array, return_inverse=True, return_counts=True
+    )
     grouped_rewards = gathered_rewards["avg"][np.argsort(inverse_indices), 0]
     split_indices = np.cumsum(counts)[:-1]
     reward_groups = np.split(grouped_rewards, split_indices)
@@ -199,6 +209,277 @@ def calculate_zero_std_ratio(prompts, gathered_rewards):
     zero_std_count = np.count_nonzero(prompt_std_devs == 0)
     zero_std_ratio = zero_std_count / len(prompt_std_devs)
     return zero_std_ratio, prompt_std_devs.mean()
+
+
+def critique_enabled(config):
+    return hasattr(config, "critique_nft") and bool(config.critique_nft.enabled)
+
+
+def critique_artifact_root(config):
+    root = str(getattr(config.critique_nft, "artifact_root", "") or "")
+    if not root:
+        root = os.environ.get("CRITIQUE_NFT_ARTIFACT_ROOT", "")
+    if not root:
+        root = os.path.join(config.logdir, config.run_name, "critique_nft_artifacts")
+    return root
+
+
+def critique_config_payload(config):
+    return {
+        "enabled": bool(config.critique_nft.enabled),
+        "dataset": str(config.critique_nft.dataset),
+        "vlm_model": str(config.critique_nft.vlm_model),
+        "refiner_source": str(config.critique_nft.refiner_source),
+        "condition_train_role": str(config.critique_nft.condition_train_role),
+        "lambda_cnft": float(config.critique_nft.lambda_cnft),
+        "lambda_cond": float(config.critique_nft.lambda_cond),
+        "lambda_bad": float(config.critique_nft.lambda_bad),
+        "lambda_delta": float(config.critique_nft.lambda_delta),
+        "lambda_prior": float(config.critique_nft.lambda_prior),
+        "use_negative_branch": bool(config.critique_nft.use_negative_branch),
+        "use_delta": bool(config.critique_nft.use_delta),
+        "teacher_gate_min_win_rate": float(config.critique_nft.teacher_gate_min_win_rate),
+        "semantic_eval_variants": list(config.critique_nft.semantic_eval_variants),
+        "semantic_eval_max_batches": int(config.critique_nft.semantic_eval_max_batches),
+    }
+
+
+def prepare_critique_artifacts(config, train_dataset, test_dataset, rank):
+    if not critique_enabled(config) or not is_main_process(rank):
+        return {}
+    dataset = str(config.critique_nft.dataset or critique_nft.dataset_name_from_config(config))
+    artifact_root = Path(critique_artifact_root(config))
+    paths = critique_nft.write_run_scaffolds(
+        artifact_root, config.run_name, critique_config_payload(config)
+    )
+    train_records = critique_nft.build_critique_records(
+        train_dataset.prompts,
+        getattr(train_dataset, "metadatas", [{} for _ in train_dataset.prompts]),
+        dataset,
+        split="train",
+    )
+    test_records = critique_nft.build_critique_records(
+        test_dataset.prompts,
+        getattr(test_dataset, "metadatas", [{} for _ in test_dataset.prompts]),
+        dataset,
+        split="test_ood",
+    )
+    prompt_root = artifact_root / "prompts" / config.run_name
+    critique_nft.append_jsonl(
+        prompt_root / "train_prompt_manifest.jsonl",
+        critique_nft.records_to_manifest_rows(train_records, used_for_training=True),
+    )
+    critique_nft.append_jsonl(
+        prompt_root / "test_ood_manifest.jsonl",
+        critique_nft.records_to_manifest_rows(test_records, used_for_training=False),
+    )
+    paths["train_prompt_manifest"] = str(prompt_root / "train_prompt_manifest.jsonl")
+    paths["test_ood_manifest"] = str(prompt_root / "test_ood_manifest.jsonl")
+    return paths
+
+
+def log_critique_teacher_gate(
+    config,
+    paths,
+    records,
+    draft_images,
+    revision_images,
+    draft_rewards,
+    revision_rewards,
+    epoch,
+    global_step,
+    rank,
+):
+    if not critique_enabled(config) or not is_main_process(rank) or not paths:
+        return
+    draft_avg = np.asarray(draft_rewards["avg"], dtype=np.float32)
+    revision_avg = np.asarray(revision_rewards["avg"], dtype=np.float32)
+    wins = revision_avg > draft_avg
+    win_rate = float(wins.mean()) if len(wins) else 0.0
+    rows = critique_nft.write_image_grid_rows(
+        Path(paths["run_root"]) / "teacher_gate_images",
+        records,
+        draft_images.cpu(),
+        revision_images.cpu(),
+        draft_avg,
+        revision_avg,
+        int(config.critique_nft.log_image_limit),
+        f"step_{global_step:06d}",
+    )
+    for row in rows:
+        row.update({"epoch": epoch, "global_step": global_step})
+    critique_nft.append_jsonl(Path(paths["stage_a_warm_jsonl"]), rows)
+    critique_nft.append_jsonl(Path(paths["stage_b_teacher_gate_jsonl"]), rows)
+    critique_nft.append_jsonl(
+        Path(paths["stage_c_rollout_jsonl"]),
+        [
+            {
+                **row,
+                "condition_train_role": str(config.critique_nft.condition_train_role),
+                "refiner_source": str(config.critique_nft.refiner_source),
+            }
+            for row in rows
+        ],
+    )
+    critique_nft.write_human_eval_rows(Path(paths["human_eval_manifest_jsonl"]), rows)
+    wandb_payload = {
+        "critique_teacher_gate/win_rate": win_rate,
+        "critique_teacher_gate/draft_reward": float(draft_avg.mean()) if len(draft_avg) else 0.0,
+        "critique_teacher_gate/revision_reward": float(revision_avg.mean())
+        if len(revision_avg)
+        else 0.0,
+        "critique_teacher_gate/revision_minus_draft": float((revision_avg - draft_avg).mean())
+        if len(revision_avg)
+        else 0.0,
+    }
+    if rows:
+        wandb_payload["critique_teacher_gate/images"] = [
+            wandb.Image(row["draft_image"], caption=f"draft | {row['prompt'][:180]}")
+            for row in rows[:4]
+        ] + [
+            wandb.Image(row["revision_image"], caption=f"revision | {row['critique'][:180]}")
+            for row in rows[:4]
+        ]
+    wandb.log(wandb_payload, step=global_step)
+
+
+def adaptive_x0_mse(prediction, target):
+    with torch.no_grad():
+        weight = torch.abs(prediction.double() - target.double()).mean(
+            dim=tuple(range(1, target.ndim)), keepdim=True
+        )
+        weight = weight.clip(min=0.00001)
+    return ((prediction - target) ** 2 / weight).mean(dim=tuple(range(1, target.ndim)))
+
+
+def critique_semantic_eval_fn(
+    pipeline,
+    test_dataloader,
+    text_encoders,
+    tokenizers,
+    config,
+    device,
+    rank,
+    world_size,
+    global_step,
+    reward_fn,
+    executor,
+    mixed_precision_dtype,
+    paths,
+):
+    if not critique_enabled(config):
+        return
+    pipeline.transformer.eval()
+    dataset = str(config.critique_nft.dataset or critique_nft.dataset_name_from_config(config))
+    neg_prompt_embed, neg_pooled_prompt_embed = compute_text_embeddings(
+        [""], text_encoders, tokenizers, max_sequence_length=128, device=device
+    )
+    max_batches = int(config.critique_nft.semantic_eval_max_batches)
+    variants = list(config.critique_nft.semantic_eval_variants)
+    test_sampler = (
+        DistributedSampler(
+            test_dataloader.dataset, num_replicas=world_size, rank=rank, shuffle=False
+        )
+        if world_size > 1
+        else None
+    )
+    eval_loader = DataLoader(
+        test_dataloader.dataset,
+        batch_size=config.sample.test_batch_size,
+        sampler=test_sampler,
+        collate_fn=test_dataloader.collate_fn,
+        num_workers=test_dataloader.num_workers,
+    )
+    for variant in variants:
+        all_rewards = defaultdict(list)
+        logged_rows = []
+        for batch_index, test_batch in enumerate(eval_loader):
+            if max_batches > 0 and batch_index >= max_batches:
+                break
+            prompts, prompt_metadata = test_batch
+            records = critique_nft.build_critique_records(
+                prompts,
+                prompt_metadata,
+                dataset,
+                start_index=batch_index * config.sample.test_batch_size,
+                split="test_ood",
+            )
+            conditioned = critique_nft.prompts_for_role(
+                records, "fix", variant=variant, all_records=records
+            )
+            prompt_embeds, pooled_prompt_embeds = compute_text_embeddings(
+                conditioned, text_encoders, tokenizers, max_sequence_length=128, device=device
+            )
+            current_batch_size = len(prompt_embeds)
+            sample_neg_prompt_embeds = neg_prompt_embed.repeat(current_batch_size, 1, 1)
+            sample_neg_pooled_prompt_embeds = neg_pooled_prompt_embed.repeat(current_batch_size, 1)
+            with torch_autocast(
+                enabled=(config.mixed_precision in ["fp16", "bf16"]), dtype=mixed_precision_dtype
+            ):
+                with torch.no_grad():
+                    images, _, _ = pipeline_with_logprob(
+                        pipeline,
+                        prompt_embeds=prompt_embeds,
+                        pooled_prompt_embeds=pooled_prompt_embeds,
+                        negative_prompt_embeds=sample_neg_prompt_embeds,
+                        negative_pooled_prompt_embeds=sample_neg_pooled_prompt_embeds,
+                        num_inference_steps=config.sample.eval_num_steps,
+                        guidance_scale=config.sample.guidance_scale,
+                        output_type="pt",
+                        height=config.resolution,
+                        width=config.resolution,
+                        noise_level=config.sample.noise_level,
+                        deterministic=True,
+                        solver="flow",
+                        model_type="sd3",
+                    )
+            rewards_future = executor.submit(
+                reward_fn, images, prompts, prompt_metadata, only_strict=False
+            )
+            rewards, _ = rewards_future.result()
+            for key, value in rewards.items():
+                rewards_tensor = torch.as_tensor(value, device=device).float()
+                all_rewards[key].append(gather_tensor_to_all(rewards_tensor, world_size).numpy())
+            if is_main_process(rank) and not logged_rows:
+                image_dir = (
+                    Path(paths.get("run_root", critique_artifact_root(config)))
+                    / "semantic_eval_images"
+                    / variant
+                )
+                image_dir.mkdir(parents=True, exist_ok=True)
+                limit = min(4, len(records), len(images))
+                for index in range(limit):
+                    image_path = image_dir / f"step_{global_step:06d}_{index:03d}.jpg"
+                    critique_nft.image_tensor_to_pil(images[index]).save(image_path)
+                    logged_rows.append(
+                        {
+                            "global_step": global_step,
+                            "variant": variant,
+                            "prompt_id": records[index]["prompt_id"],
+                            "prompt": records[index]["prompt"],
+                            "conditioned_prompt": conditioned[index],
+                            "failure_key": records[index]["failure_key"],
+                            "image": str(image_path),
+                        }
+                    )
+        if is_main_process(rank):
+            final_rewards = {
+                key: np.concatenate(value_list) for key, value_list in all_rewards.items()
+            }
+            payload = {
+                f"critique_semantic_eval/{variant}/{key}": float(np.mean(value[value != -10]))
+                for key, value in final_rewards.items()
+                if np.any(value != -10)
+            }
+            if logged_rows:
+                payload[f"critique_semantic_eval/{variant}/images"] = [
+                    wandb.Image(row["image"], caption=f"{variant} | {row['prompt'][:180]}")
+                    for row in logged_rows
+                ]
+                critique_nft.append_jsonl(Path(paths["semantic_control_jsonl"]), logged_rows)
+            wandb.log(payload, step=global_step)
+    if world_size > 1:
+        dist.barrier()
 
 
 def eval_fn(
@@ -227,12 +508,16 @@ def eval_fn(
     )
 
     sample_neg_prompt_embeds = neg_prompt_embed.repeat(config.sample.test_batch_size, 1, 1)
-    sample_neg_pooled_prompt_embeds = neg_pooled_prompt_embed.repeat(config.sample.test_batch_size, 1)
+    sample_neg_pooled_prompt_embeds = neg_pooled_prompt_embed.repeat(
+        config.sample.test_batch_size, 1
+    )
 
     all_rewards = defaultdict(list)
 
     test_sampler = (
-        DistributedSampler(test_dataloader.dataset, num_replicas=world_size, rank=rank, shuffle=False)
+        DistributedSampler(
+            test_dataloader.dataset, num_replicas=world_size, rank=rank, shuffle=False
+        )
         if world_size > 1
         else None
     )
@@ -244,25 +529,46 @@ def eval_fn(
         num_workers=test_dataloader.num_workers,
     )
 
-    for test_batch in tqdm(
-        eval_loader,
-        desc="Eval: ",
-        disable=not is_main_process(rank),
-        position=0,
+    eval_max_batches = int(getattr(config.sample, "eval_max_batches", 0))
+    for batch_index, test_batch in enumerate(
+        tqdm(
+            eval_loader,
+            desc="Eval: ",
+            disable=not is_main_process(rank),
+            position=0,
+        )
     ):
+        if eval_max_batches > 0 and batch_index >= eval_max_batches:
+            break
         prompts, prompt_metadata = test_batch
+        conditioning_prompts = prompts
+        if critique_enabled(config):
+            dataset = str(
+                config.critique_nft.dataset or critique_nft.dataset_name_from_config(config)
+            )
+            records = critique_nft.build_critique_records(
+                prompts,
+                prompt_metadata,
+                dataset,
+                split="test_ood",
+            )
+            conditioning_prompts = critique_nft.prompts_for_role(records, "z0")
         prompt_embeds, pooled_prompt_embeds = compute_text_embeddings(
-            prompts, text_encoders, tokenizers, max_sequence_length=128, device=device
+            conditioning_prompts, text_encoders, tokenizers, max_sequence_length=128, device=device
         )
         current_batch_size = len(prompt_embeds)
         if current_batch_size < len(sample_neg_prompt_embeds):  # Handle last batch
             current_sample_neg_prompt_embeds = sample_neg_prompt_embeds[:current_batch_size]
-            current_sample_neg_pooled_prompt_embeds = sample_neg_pooled_prompt_embeds[:current_batch_size]
+            current_sample_neg_pooled_prompt_embeds = sample_neg_pooled_prompt_embeds[
+                :current_batch_size
+            ]
         else:
             current_sample_neg_prompt_embeds = sample_neg_prompt_embeds
             current_sample_neg_pooled_prompt_embeds = sample_neg_pooled_prompt_embeds
 
-        with torch_autocast(enabled=(config.mixed_precision in ["fp16", "bf16"]), dtype=mixed_precision_dtype):
+        with torch_autocast(
+            enabled=(config.mixed_precision in ["fp16", "bf16"]), dtype=mixed_precision_dtype
+        ):
             with torch.no_grad():
                 images, _, _ = pipeline_with_logprob(
                     pipeline,
@@ -281,7 +587,9 @@ def eval_fn(
                     model_type="sd3",
                 )
 
-        rewards_future = executor.submit(reward_fn, images, prompts, prompt_metadata, only_strict=False)
+        rewards_future = executor.submit(
+            reward_fn, images, prompts, prompt_metadata, only_strict=False
+        )
         time.sleep(0)
         rewards, reward_metadata = rewards_future.result()
 
@@ -291,7 +599,9 @@ def eval_fn(
             all_rewards[key].append(gathered_value.numpy())
 
     if is_main_process(rank):
-        final_rewards = {key: np.concatenate(value_list) for key, value_list in all_rewards.items()}
+        final_rewards = {
+            key: np.concatenate(value_list) for key, value_list in all_rewards.items()
+        }
 
         images_to_log = images.cpu()
         prompts_to_log = prompts
@@ -305,7 +615,9 @@ def eval_fn(
                 pil.save(os.path.join(tmpdir, f"{idx}.jpg"))
 
             sampled_prompts_log = [prompts_to_log[i] for i in range(num_samples_to_log)]
-            sampled_rewards_log = [{k: final_rewards[k][i] for k in final_rewards} for i in range(num_samples_to_log)]
+            sampled_rewards_log = [
+                {k: final_rewards[k][i] for k in final_rewards} for i in range(num_samples_to_log)
+            ]
 
             wandb.log(
                 {
@@ -315,9 +627,14 @@ def eval_fn(
                             caption=f"{prompt:.1000} | "
                             + " | ".join(f"{k}: {v:.2f}" for k, v in reward.items() if v != -10),
                         )
-                        for idx, (prompt, reward) in enumerate(zip(sampled_prompts_log, sampled_rewards_log))
+                        for idx, (prompt, reward) in enumerate(
+                            zip(sampled_prompts_log, sampled_rewards_log)
+                        )
                     ],
-                    **{f"eval_reward_{key}": np.mean(value[value != -10]) for key, value in final_rewards.items()},
+                    **{
+                        f"eval_reward_{key}": np.mean(value[value != -10])
+                        for key, value in final_rewards.items()
+                    },
                 },
                 step=global_step,
             )
@@ -330,7 +647,15 @@ def eval_fn(
 
 
 def save_ckpt(
-    save_dir, transformer_ddp, global_step, rank, ema, transformer_trainable_parameters, config, optimizer, scaler
+    save_dir,
+    transformer_ddp,
+    global_step,
+    rank,
+    ema,
+    transformer_trainable_parameters,
+    config,
+    optimizer,
+    scaler,
 ):
     if is_main_process(rank):
         save_root = os.path.join(save_dir, "checkpoints", f"checkpoint-{global_step}")
@@ -452,11 +777,20 @@ def main(_):
             transformer = get_peft_model(transformer, transformer_lora_config)
         transformer.add_adapter("old", transformer_lora_config)
         transformer.set_adapter("default")
-    transformer_ddp = DDP(transformer, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
+    transformer_ddp = DDP(
+        transformer,
+        device_ids=[local_rank],
+        output_device=local_rank,
+        find_unused_parameters=False,
+    )
     transformer_ddp.module.set_adapter("default")
-    transformer_trainable_parameters = list(filter(lambda p: p.requires_grad, transformer_ddp.module.parameters()))
+    transformer_trainable_parameters = list(
+        filter(lambda p: p.requires_grad, transformer_ddp.module.parameters())
+    )
     transformer_ddp.module.set_adapter("old")
-    old_transformer_trainable_parameters = list(filter(lambda p: p.requires_grad, transformer_ddp.module.parameters()))
+    old_transformer_trainable_parameters = list(
+        filter(lambda p: p.requires_grad, transformer_ddp.module.parameters())
+    )
     transformer_ddp.module.set_adapter("default")
 
     if config.allow_tf32:
@@ -493,11 +827,17 @@ def main(_):
         seed=config.seed,
     )
     train_dataloader = DataLoader(
-        train_dataset, batch_sampler=train_sampler, num_workers=0, collate_fn=train_dataset.collate_fn, pin_memory=True
+        train_dataset,
+        batch_sampler=train_sampler,
+        num_workers=0,
+        collate_fn=train_dataset.collate_fn,
+        pin_memory=True,
     )
 
     test_sampler = (
-        DistributedSampler(test_dataset, num_replicas=world_size, rank=rank, shuffle=False) if world_size > 1 else None
+        DistributedSampler(test_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+        if world_size > 1
+        else None
     )
     test_dataloader = DataLoader(
         test_dataset,
@@ -508,13 +848,20 @@ def main(_):
         pin_memory=True,
     )
 
+    critique_paths = prepare_critique_artifacts(config, train_dataset, test_dataset, rank)
+    if critique_enabled(config) and is_main_process(rank):
+        wandb.config.update({"critique_nft_artifacts": critique_paths}, allow_val_change=True)
+        wandb.run.summary["critique_nft/artifact_root"] = critique_artifact_root(config)
+
     # --- Prompt Embeddings ---
     neg_prompt_embed, neg_pooled_prompt_embed = compute_text_embeddings(
         [""], text_encoders, tokenizers, max_sequence_length=128, device=device
     )
     sample_neg_prompt_embeds = neg_prompt_embed.repeat(config.sample.train_batch_size, 1, 1)
     train_neg_prompt_embeds = neg_prompt_embed.repeat(config.train.batch_size, 1, 1)
-    sample_neg_pooled_prompt_embeds = neg_pooled_prompt_embed.repeat(config.sample.train_batch_size, 1)
+    sample_neg_pooled_prompt_embeds = neg_pooled_prompt_embed.repeat(
+        config.sample.train_batch_size, 1
+    )
     train_neg_pooled_prompt_embeds = neg_pooled_prompt_embed.repeat(config.train.batch_size, 1)
 
     if config.sample.num_image_per_prompt == 1:
@@ -527,8 +874,12 @@ def main(_):
     executor = futures.ThreadPoolExecutor(max_workers=8)  # Async reward computation
 
     # Train!
-    samples_per_epoch = config.sample.train_batch_size * world_size * config.sample.num_batches_per_epoch
-    total_train_batch_size = config.train.batch_size * world_size * config.train.gradient_accumulation_steps
+    samples_per_epoch = (
+        config.sample.train_batch_size * world_size * config.sample.num_batches_per_epoch
+    )
+    total_train_batch_size = (
+        config.train.batch_size * world_size * config.train.gradient_accumulation_steps
+    )
 
     logger.info("***** Running training *****")
     logger.info(f"  Num Epochs = {config.num_epochs}")
@@ -537,12 +888,18 @@ def main(_):
     logger.info(f"  Gradient Accumulation steps = {config.train.gradient_accumulation_steps}")
     logger.info("")
     logger.info(f"  Total number of samples per epoch = {samples_per_epoch}")
-    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_train_batch_size}")
-    logger.info(f"  Number of gradient updates per inner epoch = {samples_per_epoch // total_train_batch_size}")
+    logger.info(
+        f"  Total train batch size (w. parallel, distributed & accumulation) = {total_train_batch_size}"
+    )
+    logger.info(
+        f"  Number of gradient updates per inner epoch = {samples_per_epoch // total_train_batch_size}"
+    )
     logger.info(f"  Number of inner epochs = {config.train.num_inner_epochs}")
 
     reward_fn = getattr(flow_grpo.rewards, "multi_score")(device, config.reward_fn)  # Pass device
-    eval_reward_fn = getattr(flow_grpo.rewards, "multi_score")(device, config.reward_fn)  # Pass device
+    eval_reward_fn = getattr(flow_grpo.rewards, "multi_score")(
+        device, config.reward_fn
+    )  # Pass device
 
     # --- Resume from checkpoint ---
     first_epoch = 0
@@ -552,12 +909,18 @@ def main(_):
         # Assuming checkpoint dir contains lora, optimizer.pt, scaler.pt
         lora_path = os.path.join(config.resume_from, "lora")
         if os.path.exists(lora_path):  # Check if it's a PEFT model save
-            transformer_ddp.module.load_adapter(lora_path, adapter_name="default", is_trainable=True)
+            transformer_ddp.module.load_adapter(
+                lora_path, adapter_name="default", is_trainable=True
+            )
             transformer_ddp.module.load_adapter(lora_path, adapter_name="old", is_trainable=False)
         else:  # Try loading full state dict if it's not a PEFT save structure
-            model_ckpt_path = os.path.join(config.resume_from, "transformer_model.pt")  # Or specific name
+            model_ckpt_path = os.path.join(
+                config.resume_from, "transformer_model.pt"
+            )  # Or specific name
             if os.path.exists(model_ckpt_path):
-                transformer_ddp.module.load_state_dict(torch.load(model_ckpt_path, map_location=device))
+                transformer_ddp.module.load_state_dict(
+                    torch.load(model_ckpt_path, map_location=device)
+                )
 
         opt_path = os.path.join(config.resume_from, "optimizer.pt")
         if os.path.exists(opt_path):
@@ -579,7 +942,9 @@ def main(_):
 
     ema = None
     if config.train.ema:
-        ema = EMAModuleWrapper(transformer_trainable_parameters, decay=0.9, update_step_interval=1, device=device)
+        ema = EMAModuleWrapper(
+            transformer_trainable_parameters, decay=0.9, update_step_interval=1, device=device
+        )
 
     num_train_timesteps = int(config.sample.num_steps * config.train.timestep_fraction)
 
@@ -609,14 +974,49 @@ def main(_):
             position=0,
         ):
             transformer_ddp.module.set_adapter("default")
-            if hasattr(train_sampler, "set_epoch") and isinstance(train_sampler, DistributedKRepeatSampler):
+            if hasattr(train_sampler, "set_epoch") and isinstance(
+                train_sampler, DistributedKRepeatSampler
+            ):
                 train_sampler.set_epoch(epoch * config.sample.num_batches_per_epoch + i)
 
             prompts, prompt_metadata = next(train_iter)
 
-            prompt_embeds, pooled_prompt_embeds = compute_text_embeddings(
-                prompts, text_encoders, tokenizers, max_sequence_length=128, device=device
-            )
+            batch_start_index = epoch * config.sample.num_batches_per_epoch * len(
+                prompts
+            ) + i * len(prompts)
+            critique_records = None
+            if critique_enabled(config):
+                dataset = str(
+                    config.critique_nft.dataset or critique_nft.dataset_name_from_config(config)
+                )
+                critique_records = critique_nft.build_critique_records(
+                    prompts,
+                    prompt_metadata,
+                    dataset,
+                    start_index=batch_start_index,
+                    split="train",
+                )
+                z0_prompts = critique_nft.prompts_for_role(critique_records, "z0")
+                fix_prompts = critique_nft.prompts_for_role(critique_records, "fix")
+                bad_prompts = critique_nft.prompts_for_role(critique_records, "bad")
+                prompt_embeds, pooled_prompt_embeds = compute_text_embeddings(
+                    z0_prompts, text_encoders, tokenizers, max_sequence_length=128, device=device
+                )
+                fix_prompt_embeds, fix_pooled_prompt_embeds = compute_text_embeddings(
+                    fix_prompts, text_encoders, tokenizers, max_sequence_length=128, device=device
+                )
+                bad_prompt_embeds, bad_pooled_prompt_embeds = compute_text_embeddings(
+                    bad_prompts, text_encoders, tokenizers, max_sequence_length=128, device=device
+                )
+            else:
+                prompt_embeds, pooled_prompt_embeds = compute_text_embeddings(
+                    prompts, text_encoders, tokenizers, max_sequence_length=128, device=device
+                )
+                fix_prompt_embeds = None
+                fix_pooled_prompt_embeds = None
+                bad_prompt_embeds = None
+                bad_pooled_prompt_embeds = None
+
             prompt_ids = tokenizers[0](
                 prompts, padding="max_length", max_length=256, truncation=True, return_tensors="pt"
             ).input_ids.to(device)
@@ -638,8 +1038,28 @@ def main(_):
                     ema,
                     transformer_trainable_parameters,
                 )
+                critique_semantic_eval_fn(
+                    pipeline,
+                    test_dataloader,
+                    text_encoders,
+                    tokenizers,
+                    config,
+                    device,
+                    rank,
+                    world_size,
+                    global_step,
+                    eval_reward_fn,
+                    executor,
+                    mixed_precision_dtype,
+                    critique_paths,
+                )
 
-            if i == 0 and epoch % config.save_freq == 0 and is_main_process(rank) and not config.debug:
+            if (
+                i == 0
+                and epoch % config.save_freq == 0
+                and is_main_process(rank)
+                and not config.debug
+            ):
                 save_ckpt(
                     config.save_dir,
                     transformer_ddp,
@@ -655,12 +1075,14 @@ def main(_):
             transformer_ddp.module.set_adapter("old")
             with torch_autocast(enabled=enable_amp, dtype=mixed_precision_dtype):
                 with torch.no_grad():
-                    images, latents, _ = pipeline_with_logprob(
+                    draft_images, draft_latents, _ = pipeline_with_logprob(
                         pipeline,
                         prompt_embeds=prompt_embeds,
                         pooled_prompt_embeds=pooled_prompt_embeds,
                         negative_prompt_embeds=sample_neg_prompt_embeds[: len(prompts)],
-                        negative_pooled_prompt_embeds=sample_neg_pooled_prompt_embeds[: len(prompts)],
+                        negative_pooled_prompt_embeds=sample_neg_pooled_prompt_embeds[
+                            : len(prompts)
+                        ],
                         num_inference_steps=config.sample.num_steps,
                         guidance_scale=config.sample.guidance_scale,
                         output_type="pt",
@@ -671,39 +1093,117 @@ def main(_):
                         solver=config.sample.solver,
                         model_type="sd3",
                     )
+                    if critique_enabled(config):
+                        images, latents, _ = pipeline_with_logprob(
+                            pipeline,
+                            prompt_embeds=fix_prompt_embeds,
+                            pooled_prompt_embeds=fix_pooled_prompt_embeds,
+                            negative_prompt_embeds=sample_neg_prompt_embeds[: len(prompts)],
+                            negative_pooled_prompt_embeds=sample_neg_pooled_prompt_embeds[
+                                : len(prompts)
+                            ],
+                            num_inference_steps=config.sample.num_steps,
+                            guidance_scale=config.sample.guidance_scale,
+                            output_type="pt",
+                            height=config.resolution,
+                            width=config.resolution,
+                            noise_level=config.sample.noise_level,
+                            deterministic=config.sample.deterministic,
+                            solver=config.sample.solver,
+                            model_type="sd3",
+                            latents=draft_latents[0].detach().clone(),
+                        )
+                    else:
+                        images = draft_images
+                        latents = draft_latents
             transformer_ddp.module.set_adapter("default")
 
             latents = torch.stack(latents, dim=1)
+            if critique_enabled(config):
+                draft_latents = torch.stack(draft_latents, dim=1)
             timesteps = pipeline.scheduler.timesteps.repeat(len(prompts), 1).to(device)
 
-            rewards_future = executor.submit(reward_fn, images, prompts, prompt_metadata, only_strict=True)
+            rewards_future = executor.submit(
+                reward_fn, images, prompts, prompt_metadata, only_strict=True
+            )
+            draft_rewards_future = (
+                executor.submit(
+                    reward_fn, draft_images, prompts, prompt_metadata, only_strict=True
+                )
+                if critique_enabled(config)
+                else None
+            )
             time.sleep(0)
 
-            samples_data_list.append(
-                {
-                    "prompt_ids": prompt_ids,
-                    "prompt_embeds": prompt_embeds,
-                    "pooled_prompt_embeds": pooled_prompt_embeds,
-                    "timesteps": timesteps,
-                    "next_timesteps": torch.concatenate([timesteps[:, 1:], torch.zeros_like(timesteps[:, :1])], dim=1),
-                    "latents_clean": latents[:, -1],
-                    "rewards_future": rewards_future,  # Store future
-                }
-            )
+            sample_payload = {
+                "prompt_ids": prompt_ids,
+                "prompt_embeds": prompt_embeds,
+                "pooled_prompt_embeds": pooled_prompt_embeds,
+                "timesteps": timesteps,
+                "next_timesteps": torch.concatenate(
+                    [timesteps[:, 1:], torch.zeros_like(timesteps[:, :1])], dim=1
+                ),
+                "latents_clean": latents[:, -1],
+                "rewards_future": rewards_future,
+            }
+            if critique_enabled(config):
+                sample_payload.update(
+                    {
+                        "fix_prompt_embeds": fix_prompt_embeds,
+                        "fix_pooled_prompt_embeds": fix_pooled_prompt_embeds,
+                        "bad_prompt_embeds": bad_prompt_embeds,
+                        "bad_pooled_prompt_embeds": bad_pooled_prompt_embeds,
+                        "draft_latents_clean": draft_latents[:, -1],
+                        "draft_rewards_future": draft_rewards_future,
+                        "critique_records": critique_records,
+                        "draft_images": draft_images.detach().cpu(),
+                        "revision_images": images.detach().cpu(),
+                    }
+                )
+            samples_data_list.append(sample_payload)
 
         for sample_item in tqdm(
-            samples_data_list, desc="Waiting for rewards", disable=not is_main_process(rank), position=0
+            samples_data_list,
+            desc="Waiting for rewards",
+            disable=not is_main_process(rank),
+            position=0,
         ):
             rewards, reward_metadata = sample_item["rewards_future"].result()
-            sample_item["rewards"] = {k: torch.as_tensor(v, device=device).float() for k, v in rewards.items()}
+            sample_item["rewards"] = {
+                k: torch.as_tensor(v, device=device).float() for k, v in rewards.items()
+            }
             del sample_item["rewards_future"]
+            if critique_enabled(config):
+                draft_rewards, _ = sample_item["draft_rewards_future"].result()
+                log_critique_teacher_gate(
+                    config,
+                    critique_paths,
+                    sample_item["critique_records"],
+                    sample_item["draft_images"],
+                    sample_item["revision_images"],
+                    draft_rewards,
+                    rewards,
+                    epoch,
+                    global_step,
+                    rank,
+                )
+                sample_item["draft_rewards"] = {
+                    k: torch.as_tensor(v, device=device).float() for k, v in draft_rewards.items()
+                }
+                del sample_item["draft_rewards_future"]
+                del sample_item["critique_records"]
+                del sample_item["draft_images"]
+                del sample_item["revision_images"]
 
         # Collate samples
         collated_samples = {
             k: (
                 torch.cat([s[k] for s in samples_data_list], dim=0)
                 if not isinstance(samples_data_list[0][k], dict)
-                else {sk: torch.cat([s[k][sk] for s in samples_data_list], dim=0) for sk in samples_data_list[0][k]}
+                else {
+                    sk: torch.cat([s[k][sk] for s in samples_data_list], dim=0)
+                    for sk in samples_data_list[0][k]
+                }
             )
             for k in samples_data_list[0].keys()
         }
@@ -718,7 +1218,9 @@ def main(_):
                 num_to_log = min(15, len(images_to_log))
                 for idx in range(num_to_log):  # log first N
                     img_data = images_to_log[idx]
-                    pil = Image.fromarray((img_data.numpy().transpose(1, 2, 0) * 255).astype(np.uint8))
+                    pil = Image.fromarray(
+                        (img_data.numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+                    )
                     pil = pil.resize((config.resolution, config.resolution))
                     pil.save(os.path.join(tmpdir, f"{idx}.jpg"))
 
@@ -734,6 +1236,29 @@ def main(_):
                     },
                     step=global_step,
                 )
+        if critique_enabled(config) and "draft_rewards" in collated_samples:
+            gathered_draft_avg = gather_tensor_to_all(
+                collated_samples["draft_rewards"]["avg"], world_size
+            ).numpy()
+            gathered_revision_avg = gather_tensor_to_all(
+                collated_samples["rewards"]["avg"], world_size
+            ).numpy()
+            if is_main_process(rank):
+                wandb.log(
+                    {
+                        "critique_teacher_gate/distributed_draft_reward": float(
+                            np.mean(gathered_draft_avg)
+                        ),
+                        "critique_teacher_gate/distributed_revision_reward": float(
+                            np.mean(gathered_revision_avg)
+                        ),
+                        "critique_teacher_gate/distributed_win_rate": float(
+                            np.mean(gathered_revision_avg > gathered_draft_avg)
+                        ),
+                    },
+                    step=global_step,
+                )
+            del collated_samples["draft_rewards"]
         collated_samples["rewards"]["avg"] = (
             collated_samples["rewards"]["avg"].unsqueeze(1).repeat(1, num_train_timesteps)
         )
@@ -766,7 +1291,9 @@ def main(_):
 
             if is_main_process(rank):
                 group_size, trained_prompt_num = stat_tracker.get_stats()
-                zero_std_ratio, reward_std_mean = calculate_zero_std_ratio(prompts_all_decoded, gathered_rewards_dict)
+                zero_std_ratio, reward_std_mean = calculate_zero_std_ratio(
+                    prompts_all_decoded, gathered_rewards_dict
+                )
                 wandb.log(
                     {
                         "group_size": group_size,
@@ -784,7 +1311,9 @@ def main(_):
             stat_tracker.clear()
         else:
             avg_rewards_all = gathered_rewards_dict["avg"]
-            advantages = (avg_rewards_all - avg_rewards_all.mean()) / (avg_rewards_all.std() + 1e-4)
+            advantages = (avg_rewards_all - avg_rewards_all.mean()) / (
+                avg_rewards_all.std() + 1e-4
+            )
         # Distribute advantages back to processes
         samples_per_gpu = collated_samples["timesteps"].shape[0]
         if advantages.ndim == 1:
@@ -803,7 +1332,11 @@ def main(_):
         del collated_samples["rewards"]
         del collated_samples["prompt_ids"]
 
-        num_batches = config.sample.num_batches_per_epoch * config.sample.train_batch_size // config.train.batch_size
+        num_batches = (
+            config.sample.num_batches_per_epoch
+            * config.sample.train_batch_size
+            // config.train.batch_size
+        )
 
         filtered_samples = collated_samples
 
@@ -823,7 +1356,10 @@ def main(_):
             shuffled_filtered_samples = {k: v[perm] for k, v in filtered_samples.items()}
 
             perms_time = torch.stack(
-                [torch.randperm(num_timesteps_filtered, device=device) for _ in range(total_batch_size_filtered)]
+                [
+                    torch.randperm(num_timesteps_filtered, device=device)
+                    for _ in range(total_batch_size_filtered)
+                ]
             )
             for key in ["timesteps", "next_timesteps"]:
                 shuffled_filtered_samples[key] = shuffled_filtered_samples[key][
@@ -853,7 +1389,10 @@ def main(_):
 
                 if config.sample.guidance_scale > 1.0:
                     embeds = torch.cat(
-                        [train_neg_prompt_embeds[:current_micro_batch_size], train_sample_batch["prompt_embeds"]]
+                        [
+                            train_neg_prompt_embeds[:current_micro_batch_size],
+                            train_sample_batch["prompt_embeds"],
+                        ]
                     )
                     pooled_embeds = torch.cat(
                         [
@@ -864,6 +1403,15 @@ def main(_):
                 else:
                     embeds = train_sample_batch["prompt_embeds"]
                     pooled_embeds = train_sample_batch["pooled_prompt_embeds"]
+                if critique_enabled(config):
+                    if config.sample.guidance_scale > 1.0:
+                        raise NotImplementedError(
+                            "Critique-NFT native loss currently expects guidance_scale <= 1.0"
+                        )
+                    fix_embeds = train_sample_batch["fix_prompt_embeds"]
+                    fix_pooled_embeds = train_sample_batch["fix_pooled_prompt_embeds"]
+                    bad_embeds = train_sample_batch["bad_prompt_embeds"]
+                    bad_pooled_embeds = train_sample_batch["bad_pooled_prompt_embeds"]
 
                 # Loop over timesteps for this micro-batch
                 for j_idx, j_timestep_orig_idx in tqdm(
@@ -905,6 +1453,21 @@ def main(_):
                             pooled_projections=pooled_embeds,
                             return_dict=False,
                         )[0]
+                        if critique_enabled(config):
+                            fix_forward_prediction = transformer_ddp(
+                                hidden_states=xt,
+                                timestep=train_sample_batch["timesteps"][:, j_idx],
+                                encoder_hidden_states=fix_embeds,
+                                pooled_projections=fix_pooled_embeds,
+                                return_dict=False,
+                            )[0]
+                            bad_forward_prediction = transformer_ddp(
+                                hidden_states=xt,
+                                timestep=train_sample_batch["timesteps"][:, j_idx],
+                                encoder_hidden_states=bad_embeds,
+                                pooled_projections=bad_pooled_embeds,
+                                return_dict=False,
+                            )[0]
 
                         with torch.no_grad():  # Reference model part
                             # For LoRA, disable adapter.
@@ -929,24 +1492,39 @@ def main(_):
                     )
                     if hasattr(config.train, "adv_mode"):
                         if config.train.adv_mode == "positive_only":
-                            advantages_clip = torch.clamp(advantages_clip, 0, config.train.adv_clip_max)
+                            advantages_clip = torch.clamp(
+                                advantages_clip, 0, config.train.adv_clip_max
+                            )
                         elif config.train.adv_mode == "negative_only":
-                            advantages_clip = torch.clamp(advantages_clip, -config.train.adv_clip_max, 0)
+                            advantages_clip = torch.clamp(
+                                advantages_clip, -config.train.adv_clip_max, 0
+                            )
                         elif config.train.adv_mode == "one_only":
                             advantages_clip = torch.where(
-                                advantages_clip > 0, torch.ones_like(advantages_clip), torch.zeros_like(advantages_clip)
+                                advantages_clip > 0,
+                                torch.ones_like(advantages_clip),
+                                torch.zeros_like(advantages_clip),
                             )
                         elif config.train.adv_mode == "binary":
                             advantages_clip = torch.sign(advantages_clip)
 
                     # normalize advantage
-                    normalized_advantages_clip = (advantages_clip / config.train.adv_clip_max) / 2.0 + 0.5
+                    normalized_advantages_clip = (
+                        advantages_clip / config.train.adv_clip_max
+                    ) / 2.0 + 0.5
                     r = torch.clamp(normalized_advantages_clip, 0, 1)
                     loss_terms["x0_norm"] = torch.mean(x0**2).detach()
                     loss_terms["x0_norm_max"] = torch.max(x0**2).detach()
-                    loss_terms["old_deviate"] = torch.mean((forward_prediction - old_prediction) ** 2).detach()
-                    loss_terms["old_deviate_max"] = torch.max((forward_prediction - old_prediction) ** 2).detach()
-                    positive_prediction = config.beta * forward_prediction + (1 - config.beta) * old_prediction.detach()
+                    loss_terms["old_deviate"] = torch.mean(
+                        (forward_prediction - old_prediction) ** 2
+                    ).detach()
+                    loss_terms["old_deviate_max"] = torch.max(
+                        (forward_prediction - old_prediction) ** 2
+                    ).detach()
+                    positive_prediction = (
+                        config.beta * forward_prediction
+                        + (1 - config.beta) * old_prediction.detach()
+                    )
                     implicit_negative_prediction = (
                         1.0 + config.beta
                     ) * old_prediction.detach() - config.beta * forward_prediction
@@ -959,7 +1537,9 @@ def main(_):
                             .mean(dim=tuple(range(1, x0.ndim)), keepdim=True)
                             .clip(min=0.00001)
                         )
-                    positive_loss = ((x0_prediction - x0) ** 2 / weight_factor).mean(dim=tuple(range(1, x0.ndim)))
+                    positive_loss = ((x0_prediction - x0) ** 2 / weight_factor).mean(
+                        dim=tuple(range(1, x0.ndim))
+                    )
                     negative_x0_prediction = xt - t_expanded * implicit_negative_prediction
                     with torch.no_grad():
                         negative_weight_factor = (
@@ -967,29 +1547,64 @@ def main(_):
                             .mean(dim=tuple(range(1, x0.ndim)), keepdim=True)
                             .clip(min=0.00001)
                         )
-                    negative_loss = ((negative_x0_prediction - x0) ** 2 / negative_weight_factor).mean(
-                        dim=tuple(range(1, x0.ndim))
-                    )
+                    negative_loss = (
+                        (negative_x0_prediction - x0) ** 2 / negative_weight_factor
+                    ).mean(dim=tuple(range(1, x0.ndim)))
 
-                    ori_policy_loss = r * positive_loss / config.beta + (1.0 - r) * negative_loss / config.beta
+                    ori_policy_loss = (
+                        r * positive_loss / config.beta + (1.0 - r) * negative_loss / config.beta
+                    )
                     policy_loss = (ori_policy_loss * config.train.adv_clip_max).mean()
 
                     loss = policy_loss
                     loss_terms["policy_loss"] = policy_loss.detach()
                     loss_terms["unweighted_policy_loss"] = ori_policy_loss.mean().detach()
 
+                    if critique_enabled(config):
+                        draft_x0 = train_sample_batch["draft_latents_clean"]
+                        default_x0_prediction = xt - t_expanded * forward_prediction
+                        fix_x0_prediction = xt - t_expanded * fix_forward_prediction
+                        bad_x0_prediction = xt - t_expanded * bad_forward_prediction
+
+                        cond_loss = adaptive_x0_mse(default_x0_prediction, x0).mean()
+                        cnft_loss = adaptive_x0_mse(fix_x0_prediction, x0).mean()
+                        bad_loss = adaptive_x0_mse(bad_x0_prediction, draft_x0).mean()
+                        delta_loss = adaptive_x0_mse(
+                            fix_x0_prediction - bad_x0_prediction,
+                            x0 - draft_x0,
+                        ).mean()
+                        loss = loss + float(config.critique_nft.lambda_cond) * cond_loss
+                        loss = loss + float(config.critique_nft.lambda_cnft) * cnft_loss
+                        if bool(config.critique_nft.use_negative_branch):
+                            loss = loss + float(config.critique_nft.lambda_bad) * bad_loss
+                        if bool(config.critique_nft.use_delta):
+                            loss = loss + float(config.critique_nft.lambda_delta) * delta_loss
+                        loss_terms["critique_cond_loss"] = cond_loss.detach()
+                        loss_terms["critique_cnft_loss"] = cnft_loss.detach()
+                        loss_terms["critique_bad_loss"] = bad_loss.detach()
+                        loss_terms["critique_delta_loss"] = delta_loss.detach()
+
                     kl_div_loss = ((forward_prediction - ref_forward_prediction) ** 2).mean(
                         dim=tuple(range(1, x0.ndim))
                     )
 
-                    loss += config.train.beta * torch.mean(kl_div_loss)
+                    prior_weight = (
+                        float(config.critique_nft.lambda_prior)
+                        if critique_enabled(config)
+                        else 1.0
+                    )
+                    loss += prior_weight * config.train.beta * torch.mean(kl_div_loss)
                     kl_div_loss = torch.mean(kl_div_loss)
                     loss_terms["kl_div_loss"] = torch.mean(kl_div_loss).detach()
                     loss_terms["kl_div"] = torch.mean(
-                        ((forward_prediction - ref_forward_prediction) ** 2).mean(dim=tuple(range(1, x0.ndim)))
+                        ((forward_prediction - ref_forward_prediction) ** 2).mean(
+                            dim=tuple(range(1, x0.ndim))
+                        )
                     ).detach()
                     loss_terms["old_kl_div"] = torch.mean(
-                        ((old_prediction - ref_forward_prediction) ** 2).mean(dim=tuple(range(1, x0.ndim)))
+                        ((old_prediction - ref_forward_prediction) ** 2).mean(
+                            dim=tuple(range(1, x0.ndim))
+                        )
                     ).detach()
 
                     loss_terms["total_loss"] = loss.detach()
@@ -1008,7 +1623,9 @@ def main(_):
                     if current_accumulated_steps % effective_grad_accum_steps == 0:
                         if mixed_precision_dtype == torch.float16:
                             scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(transformer_ddp.module.parameters(), config.train.max_grad_norm)
+                        torch.nn.utils.clip_grad_norm_(
+                            transformer_ddp.module.parameters(), config.train.max_grad_norm
+                        )
                         if mixed_precision_dtype == torch.float16:
                             scaler.step(optimizer)
                         else:
@@ -1018,10 +1635,18 @@ def main(_):
                             scaler.update()
                         optimizer.zero_grad()
 
-                        log_info = {k: torch.mean(torch.stack(v_list)).item() for k, v_list in info_accumulated.items()}
-                        info_tensor = torch.tensor([log_info[k] for k in sorted(log_info.keys())], device=device)
+                        log_info = {
+                            k: torch.mean(torch.stack(v_list)).item()
+                            for k, v_list in info_accumulated.items()
+                        }
+                        info_tensor = torch.tensor(
+                            [log_info[k] for k in sorted(log_info.keys())], device=device
+                        )
                         dist.all_reduce(info_tensor, op=dist.ReduceOp.AVG)
-                        reduced_log_info = {k: info_tensor[ki].item() for ki, k in enumerate(sorted(log_info.keys()))}
+                        reduced_log_info = {
+                            k: info_tensor[ki].item()
+                            for ki, k in enumerate(sorted(log_info.keys()))
+                        }
                         if is_main_process(rank):
                             wandb.log(
                                 {
@@ -1051,7 +1676,22 @@ def main(_):
             for src_param, tgt_param in zip(
                 transformer_trainable_parameters, old_transformer_trainable_parameters, strict=True
             ):
-                tgt_param.data.copy_(tgt_param.detach().data * decay + src_param.detach().clone().data * (1.0 - decay))
+                tgt_param.data.copy_(
+                    tgt_param.detach().data * decay
+                    + src_param.detach().clone().data * (1.0 - decay)
+                )
+
+    if critique_enabled(config) and is_main_process(rank) and critique_paths:
+        critique_nft.write_json(
+            Path(critique_paths["summary_json"]),
+            {
+                "status": "complete",
+                "global_step": global_step,
+                "run_name": config.run_name,
+                "artifacts": critique_paths,
+                "config": critique_config_payload(config),
+            },
+        )
 
     if is_main_process(rank):
         wandb.finish()

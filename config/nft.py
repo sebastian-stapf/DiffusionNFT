@@ -18,7 +18,14 @@ def get_config(name):
     return globals()[name]()
 
 
-def _get_config(base_model="sd3", n_gpus=1, gradient_step_per_epoch=1, dataset="pickscore", reward_fn={}, name=""):
+def _get_config(
+    base_model="sd3",
+    n_gpus=1,
+    gradient_step_per_epoch=1,
+    dataset="pickscore",
+    reward_fn={},
+    name="",
+):
     config = base.get_config()
     assert base_model in ["sd3"]
     assert dataset in ["pickscore", "ocr", "geneval"]
@@ -82,7 +89,12 @@ def sd3_ocr():
         "ocr": 1.0,
     }
     config = _get_config(
-        base_model="sd3", n_gpus=8, gradient_step_per_epoch=2, dataset="ocr", reward_fn=reward_fn, name="ocr"
+        base_model="sd3",
+        n_gpus=8,
+        gradient_step_per_epoch=2,
+        dataset="ocr",
+        reward_fn=reward_fn,
+        name="ocr",
     )
     config.beta = 0.1
     config.decay_type = 2
@@ -101,6 +113,27 @@ def sd3_geneval():
         reward_fn=reward_fn,
         name="geneval",
     )
+    return config
+
+
+def sd3_geneval_critique_nft():
+    config = sd3_geneval()
+    config.run_name = "nft_sd3_geneval_critique_nft"
+    config.save_dir = "logs/nft/sd3/geneval_critique_nft"
+    config.save_freq = 5
+    config.eval_freq = 10
+    config.critique_nft.enabled = True
+    config.critique_nft.dataset = "geneval"
+    config.critique_nft.condition_train_role = "z0"
+    config.critique_nft.lambda_cnft = 1.0
+    config.critique_nft.lambda_cond = 0.15
+    config.critique_nft.lambda_bad = 1.0
+    config.critique_nft.lambda_delta = 0.25
+    config.critique_nft.lambda_prior = 1.0
+    config.critique_nft.use_negative_branch = True
+    config.critique_nft.use_delta = True
+    config.critique_nft.teacher_gate_min_win_rate = 0.0
+    config.critique_nft.semantic_eval_max_batches = 1
     return config
 
 
@@ -124,7 +157,12 @@ def sd3_hpsv2():
         "hpsv2": 1.0,
     }
     config = _get_config(
-        base_model="sd3", n_gpus=8, gradient_step_per_epoch=1, dataset="pickscore", reward_fn=reward_fn, name="hpsv2"
+        base_model="sd3",
+        n_gpus=8,
+        gradient_step_per_epoch=1,
+        dataset="pickscore",
+        reward_fn=reward_fn,
+        name="hpsv2",
     )
     return config
 

@@ -50,6 +50,9 @@ def get_config():
     sample.train_batch_size = 1
     sample.num_image_per_prompt = 1
     sample.test_batch_size = 1
+    # 0 means evaluate the full test split. Positive values cap eval batches for
+    # smoke/debug runs without changing production defaults.
+    sample.eval_max_batches = 0
     # number of batches to sample per epoch. the total number of samples per epoch is `num_batches_per_epoch *
     # batch_size * num_gpus`.
     sample.num_batches_per_epoch = 2
@@ -104,5 +107,33 @@ def get_config():
 
     ###### Per-Prompt Stat Tracking ######
     config.per_prompt_stat_tracking = True
+
+    ###### Critique-NFT ######
+    config.critique_nft = critique_nft = ml_collections.ConfigDict()
+    critique_nft.enabled = False
+    critique_nft.dataset = ""
+    critique_nft.vlm_model = "Qwen/Qwen3.5-27B-FP8"
+    critique_nft.refiner_source = "EMA old-adapter same-noise SD3.5 z_fix rollout"
+    critique_nft.artifact_root = ""
+    critique_nft.condition_train_role = "z0"
+    critique_nft.lambda_cnft = 1.0
+    critique_nft.lambda_cond = 0.15
+    critique_nft.lambda_bad = 1.0
+    critique_nft.lambda_delta = 0.25
+    critique_nft.lambda_prior = 1.0
+    critique_nft.use_negative_branch = True
+    critique_nft.use_delta = True
+    critique_nft.teacher_gate_min_win_rate = 0.0
+    critique_nft.log_image_limit = 8
+    critique_nft.semantic_eval_max_batches = 1
+    critique_nft.semantic_eval_variants = (
+        "correct",
+        "paraphrase",
+        "same_rubric_wrong_instance",
+        "prompt_only_revision",
+        "generic",
+        "random_shuffled",
+        "wrong_rubric",
+    )
 
     return config
