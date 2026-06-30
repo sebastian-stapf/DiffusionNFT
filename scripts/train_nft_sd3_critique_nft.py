@@ -145,6 +145,13 @@ class ImageMainConfig:
     wandb_project: str
     wandb_mode: str
     allow_disabled_wandb: bool = False
+    sd35_sample_count: int = 0
+    sd35_model: str = "stabilityai/stable-diffusion-3.5-medium"
+    sd35_num_steps: int = 4
+    sd35_guidance_scale: float = 4.5
+    sd35_height: int = 512
+    sd35_width: int = 512
+    sd35_local_files_only: bool = True
 
 
 class ImageMainToyDataset(Dataset[dict[str, Any]]):
@@ -1304,6 +1311,87 @@ def write_split_generated_images(
     return images, image_dir, len(images)
 
 
+def write_sd35_prompt_images(
+    cfg: ImageMainConfig,
+    split_records: Sequence[PromptRecord],
+    split_name: str,
+    output_root: Path,
+    device: torch.device,
+) -> tuple[list[wandb.Image], Path, int]:
+    """Generate actual SD3.5 RGB images from prompts for train/val smoke logging."""
+
+    if cfg.sd35_sample_count <= 0:
+        return [], output_root / f"sd35_{split_name}_images", 0
+    if device.type != "cuda":
+        raise RuntimeError("SD3.5 sample generation requires a CUDA device")
+    try:
+        from diffusers import StableDiffusion3Pipeline
+    except Exception as exc:
+        raise RuntimeError(
+            "SD3.5 samples requested, but diffusers is not importable"
+        ) from exc
+
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    pipe = StableDiffusion3Pipeline.from_pretrained(
+        cfg.sd35_model,
+        torch_dtype=dtype,
+        local_files_only=cfg.sd35_local_files_only,
+    )
+    pipe = pipe.to(device)
+    pipe.set_progress_bar_config(disable=True)
+
+    output_dir = output_root / f"sd35_{split_name}_images"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    images: list[wandb.Image] = []
+    selected_records = list(split_records[: cfg.sd35_sample_count])
+    for index, record in enumerate(selected_records):
+        generator = torch.Generator(device=device).manual_seed(
+            cfg.seed + 10_000 + index + (0 if split_name == "train" else 1_000)
+        )
+        image = pipe(
+            prompt=record.prompt,
+            num_inference_steps=cfg.sd35_num_steps,
+            guidance_scale=cfg.sd35_guidance_scale,
+            height=cfg.sd35_height,
+            width=cfg.sd35_width,
+            generator=generator,
+        ).images[0]
+        image_path = output_dir / f"{split_name}_{index:03d}.png"
+        image.save(image_path)
+        metadata_path = output_dir / f"{split_name}_{index:03d}.json"
+        metadata_path.write_text(
+            json.dumps(
+                {
+                    "split": split_name,
+                    "prompt_id": record.prompt_id,
+                    "prompt_hash": record.prompt_hash,
+                    "prompt": record.prompt,
+                    "model": cfg.sd35_model,
+                    "num_inference_steps": cfg.sd35_num_steps,
+                    "guidance_scale": cfg.sd35_guidance_scale,
+                    "height": cfg.sd35_height,
+                    "width": cfg.sd35_width,
+                    "seed": cfg.seed
+                    + 10_000
+                    + index
+                    + (0 if split_name == "train" else 1_000),
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        images.append(
+            wandb.Image(
+                str(image_path),
+                caption=f"SD3.5 {split_name} | {record.prompt_id} | {record.prompt[:180]}",
+            )
+        )
+    del pipe
+    torch.cuda.empty_cache()
+    return images, output_dir, len(images)
+
+
 def run_image_main(cfg: ImageMainConfig) -> dict[str, Any]:
     """Run the group-01 manifest, smoke, training, evaluation, and artifact path."""
 
@@ -1419,6 +1507,38 @@ def run_image_main(cfg: ImageMainConfig) -> dict[str, Any]:
                 wandb.log({"images": split_images, "train_images": split_images})
             else:
                 wandb.log({"eval_images": split_images, "val_images": split_images})
+
+    for split_name, split_records in (
+        ("train", train_records),
+        ("val", manifests["val"]),
+    ):
+        sd35_images, sd35_image_dir, sd35_image_count = write_sd35_prompt_images(
+            cfg,
+            split_records,
+            split_name,
+            eval_sample_dir,
+            device,
+        )
+        metrics[f"sd35_{split_name}_image_dir"] = str(sd35_image_dir)
+        metrics[f"sd35_{split_name}_image_count"] = sd35_image_count
+        write_jsonl(
+            cfg.log_path,
+            {
+                "event": "sd35_generated_images",
+                "split": split_name,
+                "path": str(sd35_image_dir),
+                "count": sd35_image_count,
+                "model": cfg.sd35_model,
+                "num_inference_steps": cfg.sd35_num_steps,
+            },
+        )
+        if wandb_run is not None and sd35_images:
+            if split_name == "train":
+                wandb.log({"images": sd35_images, "sd35_train_images": sd35_images})
+            else:
+                wandb.log(
+                    {"eval_images": sd35_images, "sd35_val_images": sd35_images}
+                )
 
     rollout_rows: list[dict[str, Any]] = []
     critique_rows: list[dict[str, Any]] = []
@@ -1591,6 +1711,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--wandb-mode", default=os.environ.get("WANDB_MODE", "online"))
     parser.add_argument("--allow-disabled-wandb", action="store_true")
+    parser.add_argument("--sd35-sample-count", type=int, default=0)
+    parser.add_argument(
+        "--sd35-model", default="stabilityai/stable-diffusion-3.5-medium"
+    )
+    parser.add_argument("--sd35-num-steps", type=int, default=4)
+    parser.add_argument("--sd35-guidance-scale", type=float, default=4.5)
+    parser.add_argument("--sd35-height", type=int, default=512)
+    parser.add_argument("--sd35-width", type=int, default=512)
+    parser.add_argument(
+        "--sd35-allow-download",
+        action="store_true",
+        help="Allow Hugging Face downloads for SD3.5 sample generation.",
+    )
     return parser.parse_args()
 
 
@@ -1633,6 +1766,13 @@ def config_from_args(args: argparse.Namespace) -> ImageMainConfig:
         wandb_project=args.wandb_project,
         wandb_mode=args.wandb_mode,
         allow_disabled_wandb=args.allow_disabled_wandb,
+        sd35_sample_count=args.sd35_sample_count,
+        sd35_model=args.sd35_model,
+        sd35_num_steps=args.sd35_num_steps,
+        sd35_guidance_scale=args.sd35_guidance_scale,
+        sd35_height=args.sd35_height,
+        sd35_width=args.sd35_width,
+        sd35_local_files_only=not args.sd35_allow_download,
     )
 
 
