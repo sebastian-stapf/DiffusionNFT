@@ -122,6 +122,8 @@ def sd3_geneval_critique_nft():
     config.save_dir = "logs/nft/sd3/geneval_critique_nft"
     config.save_freq = 5
     config.eval_freq = 10
+    config.train.batch_size = 3
+    config.train.gradient_accumulation_steps = 48
     config.critique_nft.enabled = True
     config.critique_nft.dataset = "geneval"
     config.critique_nft.condition_train_role = "z0"
