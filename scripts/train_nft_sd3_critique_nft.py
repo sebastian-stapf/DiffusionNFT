@@ -99,6 +99,24 @@ SCALAR_CONDITION = (
 )
 
 GENERIC_CRITIQUE = "general prompt faithfulness and image quality should be improved"
+DEFAULT_VLM_MODEL = "Qwen/Qwen3.5-27B-FP8"
+DEFAULT_DATASET_SCOPE = ("geneval", "ocr", "pickscore")
+DATASET_FAILURE_KEYS: dict[str, tuple[str, ...]] = {
+    "geneval": ("alignment_missing_object", "alignment_spatial_reversal"),
+    "ocr": ("ocr_misspelled_text", "ocr_unreadable_text"),
+    "pickscore": (
+        "quality_blur_noise",
+        "quality_blocky_texture",
+        "aesthetic_poor_lighting",
+        "aesthetic_visual_clutter",
+    ),
+    "optional": (),
+}
+FAILURE_SOURCE: dict[str, str] = {
+    key: dataset
+    for dataset, keys in DATASET_FAILURE_KEYS.items()
+    for key in keys
+}
 
 
 @dataclass(frozen=True)
@@ -152,6 +170,8 @@ class ImageMainConfig:
     sd35_height: int = 512
     sd35_width: int = 512
     sd35_local_files_only: bool = True
+    dataset_scope: tuple[str, ...] = DEFAULT_DATASET_SCOPE
+    vlm_model: str = DEFAULT_VLM_MODEL
 
 
 class ImageMainToyDataset(Dataset[dict[str, Any]]):
@@ -376,43 +396,144 @@ def read_geneval_prompts(path: Path, limit: int) -> list[str]:
     return prompts
 
 
-def official_ood_prompts(dataset_root: Path, count: int) -> list[tuple[str, str, str]]:
+def normalize_dataset_scope(scope: Sequence[str]) -> tuple[str, ...]:
+    """Normalize dataset-scope names and expand the optional all shortcut."""
+
+    normalized: list[str] = []
+    for raw_name in scope:
+        name = raw_name.strip().lower()
+        if not name:
+            continue
+        if name == "all":
+            for candidate in ("geneval", "ocr", "pickscore", "optional"):
+                if candidate not in normalized:
+                    normalized.append(candidate)
+            continue
+        if name not in DATASET_FAILURE_KEYS:
+            raise ValueError(
+                f"unknown dataset scope {raw_name!r}; expected one of "
+                f"{sorted(DATASET_FAILURE_KEYS)} or 'all'"
+            )
+        if name not in normalized:
+            normalized.append(name)
+    if not normalized:
+        raise ValueError("dataset scope must contain at least one dataset")
+    return tuple(normalized)
+
+
+def parse_dataset_scope(value: str | Sequence[str]) -> tuple[str, ...]:
+    """Parse a comma-separated dataset scope string."""
+
+    if isinstance(value, str):
+        return normalize_dataset_scope(value.split(","))
+    return normalize_dataset_scope(value)
+
+
+def failure_keys_for_scope(scope: Sequence[str]) -> tuple[str, ...]:
+    """Return ordered failure keys enabled by the requested dataset scope."""
+
+    keys: list[str] = []
+    for dataset in normalize_dataset_scope(scope):
+        for failure_key in DATASET_FAILURE_KEYS[dataset]:
+            if failure_key not in keys:
+                keys.append(failure_key)
+    return tuple(keys)
+
+
+def source_for_failure_key(failure_key: str) -> str:
+    """Return the logical primary dataset source for a synthetic failure key."""
+
+    dataset = FAILURE_SOURCE.get(failure_key, "generated")
+    if dataset == "optional":
+        return "generated_optional_extension_template"
+    return f"generated_{dataset}_template_disjoint_from_official_tests"
+
+
+def cycle_failure_key(keys: Sequence[str], index: int) -> str:
+    """Cycle through a non-empty failure-key sequence."""
+
+    if not keys:
+        raise ValueError("failure-key sequence must be non-empty")
+    return keys[index % len(keys)]
+
+
+def official_ood_prompts(
+    dataset_root: Path, count: int, dataset_scope: Sequence[str]
+) -> list[tuple[str, str, str]]:
     """Return held-out official prompts from the DiffusionNFT prompt files."""
 
     if count <= 0:
         return []
-    per_source = max(1, math.ceil(count / 3))
+    scope = normalize_dataset_scope(dataset_scope)
+    active_sources = [name for name in scope if name in {"geneval", "ocr", "pickscore"}]
+    if "optional" in scope:
+        active_sources.append("drawbench")
+    if not active_sources:
+        return []
+    per_source = max(1, math.ceil(count / len(active_sources)))
     collected: list[tuple[str, str, str]] = []
-    for prompt in read_geneval_prompts(
-        dataset_root / "geneval" / "test_metadata.jsonl", per_source
-    ):
-        collected.append(
-            ("diffusionnft_geneval_test", prompt, "alignment_missing_object")
-        )
-    for prompt in read_text_prompts(dataset_root / "ocr" / "test.txt", per_source):
-        collected.append(("diffusionnft_ocr_test", prompt, "ocr_misspelled_text"))
-    for prompt in read_text_prompts(
-        dataset_root / "drawbench" / "test.txt", per_source
-    ):
-        collected.append(
-            ("diffusionnft_drawbench_test", prompt, "aesthetic_visual_clutter")
-        )
+    if "geneval" in active_sources:
+        for index, prompt in enumerate(
+            read_geneval_prompts(
+                dataset_root / "geneval" / "test_metadata.jsonl", per_source
+            )
+        ):
+            collected.append(
+                (
+                    "diffusionnft_geneval_test",
+                    prompt,
+                    cycle_failure_key(DATASET_FAILURE_KEYS["geneval"], index),
+                )
+            )
+    if "ocr" in active_sources:
+        for index, prompt in enumerate(
+            read_text_prompts(dataset_root / "ocr" / "test.txt", per_source)
+        ):
+            collected.append(
+                (
+                    "diffusionnft_ocr_test",
+                    prompt,
+                    cycle_failure_key(DATASET_FAILURE_KEYS["ocr"], index),
+                )
+            )
+    if "pickscore" in active_sources:
+        for prompt in read_text_prompts(
+            dataset_root / "pickscore" / "test.txt", per_source
+        ):
+            collected.append(
+                ("diffusionnft_pickscore_test", prompt, "aesthetic_visual_clutter")
+            )
+    if "drawbench" in active_sources:
+        for prompt in read_text_prompts(
+            dataset_root / "drawbench" / "test.txt", per_source
+        ):
+            collected.append(
+                ("diffusionnft_drawbench_test", prompt, "aesthetic_poor_lighting")
+            )
     return collected[:count]
 
 
-def generated_records(split: str, count: int, offset: int = 0) -> list[PromptRecord]:
+def generated_records(
+    split: str,
+    count: int,
+    offset: int = 0,
+    failure_keys: Sequence[str] = FAILURE_KEYS,
+) -> list[PromptRecord]:
     """Create deterministic non-official prompt records."""
 
+    active_failure_keys = tuple(failure_keys)
+    if not active_failure_keys:
+        raise ValueError("at least one failure key is required")
     records: list[PromptRecord] = []
     for index in range(count):
-        failure_key = FAILURE_KEYS[(index + offset) % len(FAILURE_KEYS)]
+        failure_key = active_failure_keys[(index + offset) % len(active_failure_keys)]
         prompt = generated_prompt(failure_key, index + offset)
         records.append(
             make_record(
                 split=split,
                 index=index,
                 prompt=prompt,
-                source="generated_template_disjoint_from_official_tests",
+                source=source_for_failure_key(failure_key),
                 failure_key=failure_key,
                 official_benchmark_prompt=False,
             )
@@ -423,13 +544,24 @@ def generated_records(split: str, count: int, offset: int = 0) -> list[PromptRec
 def create_prompt_manifests(cfg: ImageMainConfig) -> dict[str, Path]:
     """Create the four prompt manifests required by Experiment 01."""
 
-    train_records = generated_records("train", cfg.train_count, offset=0)
-    val_records = generated_records("val", cfg.val_count, offset=10_000)
-    test_id_records = generated_records("test_id", cfg.test_count, offset=20_000)
-    official_prompts = official_ood_prompts(cfg.dataset_root, cfg.ood_count)
+    failure_keys = failure_keys_for_scope(cfg.dataset_scope)
+    train_records = generated_records(
+        "train", cfg.train_count, offset=0, failure_keys=failure_keys
+    )
+    val_records = generated_records(
+        "val", cfg.val_count, offset=10_000, failure_keys=failure_keys
+    )
+    test_id_records = generated_records(
+        "test_id", cfg.test_count, offset=20_000, failure_keys=failure_keys
+    )
+    official_prompts = official_ood_prompts(
+        cfg.dataset_root, cfg.ood_count, cfg.dataset_scope
+    )
     if len(official_prompts) < cfg.ood_count:
         missing = cfg.ood_count - len(official_prompts)
-        generated_ood = generated_records("test_ood", missing, offset=30_000)
+        generated_ood = generated_records(
+            "test_ood", missing, offset=30_000, failure_keys=failure_keys
+        )
         official_records = [
             make_record(
                 split="test_ood",
@@ -1443,6 +1575,9 @@ def run_image_main(cfg: ImageMainConfig) -> dict[str, Any]:
         "run_name": cfg.run_name,
         "git_commit": git_commit(),
         "command": " ".join(sys.argv),
+        "dataset_scope": list(cfg.dataset_scope),
+        "active_failure_keys": list(failure_keys_for_scope(cfg.dataset_scope)),
+        "vlm_model": cfg.vlm_model,
         "device": str(device),
         "torch_version": torch.__version__,
         "cuda_available": torch.cuda.is_available(),
@@ -1724,6 +1859,19 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Allow Hugging Face downloads for SD3.5 sample generation.",
     )
+    parser.add_argument(
+        "--dataset-scope",
+        default=os.environ.get("IMAGE_MAIN_DATASET_SCOPE", "geneval,ocr,pickscore"),
+        help=(
+            "Comma-separated primary dataset scope. Default is "
+            "geneval,ocr,pickscore; use all to include optional diagnostics."
+        ),
+    )
+    parser.add_argument(
+        "--vlm-model",
+        default=os.environ.get("VLM_MODEL", DEFAULT_VLM_MODEL),
+        help="VLM critic model identifier recorded for critique collection.",
+    )
     return parser.parse_args()
 
 
@@ -1773,6 +1921,8 @@ def config_from_args(args: argparse.Namespace) -> ImageMainConfig:
         sd35_height=args.sd35_height,
         sd35_width=args.sd35_width,
         sd35_local_files_only=not args.sd35_allow_download,
+        dataset_scope=parse_dataset_scope(args.dataset_scope),
+        vlm_model=args.vlm_model,
     )
 
 
